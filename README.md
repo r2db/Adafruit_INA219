@@ -14,3 +14,5 @@ Adafruit invests time and resources providing this open source code, please supp
 
 Written by Ktown for Adafruit Industries.
 MIT license, all text above must be included in any redistribution
+
+This fork of the library has been heavily modified in order to use the full capabilities of the INA219.

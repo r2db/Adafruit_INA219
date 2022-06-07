@@ -36,7 +36,7 @@
  */
 Adafruit_INA219::Adafruit_INA219(uint8_t addr) {
   ina219_i2caddr = addr;
-  ina219_currentDivider_mA = 0;
+  ina219_currentDivider_mA = 0.0f;
   ina219_powerMultiplier_mW = 0.0f;
 }
 
@@ -81,8 +81,12 @@ int16_t Adafruit_INA219::getBusVoltage_raw() {
       Adafruit_BusIO_Register(i2c_dev, INA219_REG_BUSVOLTAGE, 2, MSBFIRST);
   _success = bus_voltage_reg.read(&value);
 
-  // Shift to the right 3 to drop CNVR and OVF and multiply by LSB
-  return (int16_t)((value >> 3) * 4);
+  // Set flags
+  _overflow = value & 0x01;        // Overflow flag is bit 0
+  _conversionReady = value & 0x02; // Conversion Ready flag is bit 1
+  // Shift to the right 3 to drop CNVR and OVF and multiply by 4 mV per LSB
+  // For efficiency, shift to the right 1 and drop the two LSB
+  return (int16_t)((value >> 1) & 0xFC);
 }
 
 /*!
@@ -183,7 +187,167 @@ float Adafruit_INA219::getPower_mW() {
 }
 
 /*!
- *  @brief  Configures to INA219 to be able to measure up to 32V and 2A
+ *  @brief  Gets the stored value of the shunt resistor
+ *  @return resistor value in Ohms
+ */
+float Adafruit_INA219::getShuntResistor_Ohms() {
+  return ina219_shuntResistor_Ohms;
+}
+
+/*!
+ *  @brief  Gets the configuration register value
+ *  @return the value of the 0x00 register
+ */
+uint16_t Adafruit_INA219::getConfig() {
+  uint16_t value;
+  Adafruit_BusIO_Register configuration_reg =
+      Adafruit_BusIO_Register(i2c_dev, INA219_REG_CONFIG, 2, MSBFIRST);
+  _success = configuration_reg.read(&value);
+  return value;
+}
+
+/*!
+ *  @brief  Gets the calibration register value
+ *  @return the value of the 0x05 register
+ */
+int16_t Adafruit_INA219::getCalibration() {
+  uint16_t value;
+  Adafruit_BusIO_Register calibration_reg =
+      Adafruit_BusIO_Register(i2c_dev, INA219_REG_CALIBRATION, 2, MSBFIRST);
+  _success = calibration_reg.read(&value);
+  return value;
+}
+
+/*!
+ *  @brief  Configures the INA219 to user preferences
+ *  @notes  - A supplied calibration register value takes precedence over
+ *          a calculated value, but it may cause loss of precision.
+ *          - Only shunt resistance or both shunt ampacity and milliVolt
+ *          rating need to be supplied for calculation of the current
+ *          register calibration. Shunt resistance takes precedence if all
+ *          values are supplied.
+ *          - If no calibration value or resistance are supplied and the
+ *          calibration cannot be calculated with the supplied data then
+ *          the current/ power calculations will return zero.
+ */
+void Adafruit_INA219::setConfiguration(
+            INA219_CONFIG_BVOLTAGERANGE voltageRange, 
+            INA219_CONFIG_GAIN currentGain,
+            INA219_CONFIG_BADCRES busADCResolution,
+            INA219_CONFIG_SADCRES shuntADCResolution,
+            float shuntResistorOhms, float shuntRatedCurrentAmps,
+            float shuntRatedMilliVolts,
+            float maxExpectedCurrentAmps, uint16_t calibrationRegister,
+            INA219_CONFIG_MODE operatingMode) {
+  Adafruit_BusIO_Register config_reg =
+      Adafruit_BusIO_Register(i2c_dev, INA219_REG_CONFIG, 2, MSBFIRST);
+  uint16_t config = 0;
+  Adafruit_BusIO_Register calibration_reg =
+      Adafruit_BusIO_Register(i2c_dev, INA219_REG_CALIBRATION, 2, MSBFIRST);
+  float cal = 0;
+  float currentLSB = 0;
+  uint8_t gain = 1;
+  
+  // Sanitize the configuration register inputs, reset the configuration,
+  // and set config as requested
+  currentGain &= INA219_CONFIG_GAIN_MASK;
+  // Save the current gain divisor in variable gain
+  while (config < currentGain) {
+      gain *= 2;
+      config += INA219_CONFIG_GAIN_2_80MV;
+  }
+  voltageRange &= INA219_CONFIG_BVOLTAGE_MASK;
+  config |= voltageRange;
+  busADCResolution &= INA219_CONFIG_BADCRES_MASK;
+  config |= busADCResolution;
+  shuntADCResolution &= INA219_CONFIG_SADCRES_MASK;
+  config |= shuntADCResolution;
+  operatingMode &= INA219_CONFIG_MODE_MASK;
+  config |= operatingMode;
+  ina219_configValue = config;
+  _success = config_reg.write(INA219_CONFIG_RESET, 2);
+  _success &= config_reg.write(ina219_configValue, 2);
+  
+  // Sanitize the supplied data (resistance, voltage, current) as these numbers
+  // should never be negative numbers. The calibration register does not have a
+  // sign bit.
+  if (shuntResistorOhms < 0) { shuntResistorOhms *= -1; }
+  if (shuntRatedCurrentAmps < 0) { shuntRatedCurrentAmps *= -1; }
+  if (shuntRatedMilliVolts < 0) { shuntRatedMilliVolts *= -1; }
+  if (maxExpectedCurrentAmps < 0) { maxExpectedCurrentAmps *= -1; }
+
+  // If the shunt resistance was not supplied then attempt to calculate it.
+  if (shuntResistorOhms == 0) {
+      // If the shunt rated current was not supplied avoid a div/0 error
+      if (shuntRatedCurrentAmps > 0) {
+          shuntResistorOhms = shuntRatedMilliVolts / shuntRatedCurrent;
+      }
+  }
+  ina219_shuntResistor_Ohms = shuntResistorOhms;
+
+  // If the maximum expected current was not supplied then calculate it using the
+  // supplied resistance and gain settings. If the maximum expected current exceeds
+  // a shunt voltage of 320 mV (the sensor's maximum range) or the maximum voltage
+  // at the set gain then derate the maximum expected current
+  if ((maxExpectedCurrentAmps == 0 && shuntResistorOhms > 0) ||
+     (maxExpectedCurrentAmps * shuntResistorOhms > 0.32 / gain)) {
+      maxExpectedCurrentAmps = 0.32 / (gain * shuntResistorOhms);
+  }
+
+  // Voltage per LSB is a constant 10 uV/ count - the gain only sets the bit range
+  //     (PGA=/1 = 12 bits for +/- 40 mV, PGA=/2 = 13 bits for +/- 80 mV,
+  //     PGA=/4 = 14 bits for +/- 160 mV, PGA=/8 = 15 bits for +/- 320 mV)
+  // CurrentLSB = Maximum Expected Current/ 32,767 or 2^15-1
+
+  currentLSB = maxExpectedCurrentAmps / 32767;
+
+  // Compute the calibration register
+  // Cal = trunc (0.04096 / (Current_LSB * RSHUNT))
+  // Cal = 4096 (0x1000) for reference board
+
+  // If the shunt resistance could not be calculated or currentLSB is zero then skip
+  // this calculation, otherwise, perform the calculation to determine calibration.
+  if (shuntResistorOhms > 0 && currentLSB != 0) {
+      cal = 0.04096 / (currentLSB * shuntResistorOhms);
+  }
+
+  // Calibration register sanity checks. Make sure that the calibration register
+  // will give a reasonable measurement range for current (no more than 1 bit
+  // of loss of precision over the full scale range). As the voltage range is clamped
+  // to +/- 4000/ 8000/ 16000/ 32000 but the current register is a full scale signed
+  // 16 bit integer (+32767/-32768) the voltage reading can be multiplied by up to
+  // 1.024 (32,767/32000) at gain/1 without significant loss of precision.
+  if (cal != 0) {
+      while ((uint16_t) cal < 2048) {
+          cal *= 2; // shunt voltage * 2048 / 4096 is 1 bit loss of precision
+      }
+      while ((uint16_t) cal > (4194 * gain)) {
+          cal /= 2; // For each fewer bit in shunt voltage (change in gain) the
+                    // upper limit doubles before the current calculation overflows.
+      }
+      // 'cal' is now either zero or between 2048 and 4194 * gain (inclusive) and
+      // there is no more than our arbitrary limit of 1 bit loss of precision.
+  }
+  // If a value for 'calibrationRegister' was not supplied, use the calculated one
+  if (calibrationRegister == 0) {
+      ina219_calValue = (uint16_t) cal;
+  } else {
+      ina219_calValue = calibrationRegister;
+  }
+  ina219_calValue &= 0xFFFE; // Discard the least significant bit (read-only and zero
+                             // per datasheet page 24)
+
+  // Set Calibration register to 'cal' calculated above
+  _success &= calibration_reg.write(ina219_calValue, 2);
+
+  // Set multipliers to convert raw current/power values using the written calibration
+  // register value
+  ina219_currentDivider_mA = ina219_calValue * ina219_shuntResistor_Ohms / 40.96;
+  ina219_powerMultiplier_mW = 20 / ina219_currentDivider; // Datasheet equation 3
+}
+
+/*!
+ *  @brief  Configures the INA219 to be able to measure up to 32V and 2A
  *          of current.  Each unit of current corresponds to 100uA, and
  *          each unit of power corresponds to 2mW. Counter overflow
  *          occurs at 3.2A.
@@ -200,6 +364,7 @@ void Adafruit_INA219::setCalibration_32V_2A() {
   // VBUS_MAX = 32V             (Assumes 32V, can also be set to 16V)
   // VSHUNT_MAX = 0.32          (Assumes Gain 8, 320mV, can also be 0.16, 0.08,
   // 0.04) RSHUNT = 0.1               (Resistor value in ohms)
+  ina219_shuntResistor_Ohms = 0.1;
 
   // 1. Determine max possible current
   // MaxPossible_I = VSHUNT_MAX / RSHUNT
@@ -263,13 +428,13 @@ void Adafruit_INA219::setCalibration_32V_2A() {
   calibration_reg.write(ina219_calValue, 2);
 
   // Set Config register to take into account the settings above
-  uint16_t config = INA219_CONFIG_BVOLTAGERANGE_32V |
+  ina219_configValue = INA219_CONFIG_BVOLTAGERANGE_32V |
                     INA219_CONFIG_GAIN_8_320MV | INA219_CONFIG_BADCRES_12BIT |
                     INA219_CONFIG_SADCRES_12BIT_1S_532US |
                     INA219_CONFIG_MODE_SANDBVOLT_CONTINUOUS;
   Adafruit_BusIO_Register config_reg =
       Adafruit_BusIO_Register(i2c_dev, INA219_REG_CONFIG, 2, MSBFIRST);
-  _success = config_reg.write(config, 2);
+  _success = config_reg.write(ina219_configValue, 2);
 }
 
 /*!
@@ -291,7 +456,7 @@ void Adafruit_INA219::powerSave(bool on) {
 }
 
 /*!
- *  @brief  Configures to INA219 to be able to measure up to 32V and 1A
+ *  @brief  Configures the INA219 to be able to measure up to 32V and 1A
  *          of current.  Each unit of current corresponds to 40uA, and each
  *          unit of power corresponds to 800uW. Counter overflow occurs at
  *          1.3A.
@@ -308,6 +473,7 @@ void Adafruit_INA219::setCalibration_32V_1A() {
   // VBUS_MAX = 32V		(Assumes 32V, can also be set to 16V)
   // VSHUNT_MAX = 0.32	(Assumes Gain 8, 320mV, can also be 0.16, 0.08, 0.04)
   // RSHUNT = 0.1			(Resistor value in ohms)
+  ina219_shuntResistor_Ohms = 0.1;
 
   // 1. Determine max possible current
   // MaxPossible_I = VSHUNT_MAX / RSHUNT
@@ -374,17 +540,17 @@ void Adafruit_INA219::setCalibration_32V_1A() {
   calibration_reg.write(ina219_calValue, 2);
 
   // Set Config register to take into account the settings above
-  uint16_t config = INA219_CONFIG_BVOLTAGERANGE_32V |
+  ina219_configValue = INA219_CONFIG_BVOLTAGERANGE_32V |
                     INA219_CONFIG_GAIN_8_320MV | INA219_CONFIG_BADCRES_12BIT |
                     INA219_CONFIG_SADCRES_12BIT_1S_532US |
                     INA219_CONFIG_MODE_SANDBVOLT_CONTINUOUS;
   Adafruit_BusIO_Register config_reg =
       Adafruit_BusIO_Register(i2c_dev, INA219_REG_CONFIG, 2, MSBFIRST);
-  _success = config_reg.write(config, 2);
+  _success = config_reg.write(ina219_configValue, 2);
 }
 
 /*!
- *  @brief set device to alibration which uses the highest precision for
+ *  @brief set device to calibration which uses the highest precision for
  *     current measurement (0.1mA), at the expense of
  *     only supporting 16V at 400mA max.
  */
@@ -397,6 +563,7 @@ void Adafruit_INA219::setCalibration_16V_400mA() {
   // VBUS_MAX = 16V
   // VSHUNT_MAX = 0.04          (Assumes Gain 1, 40mV)
   // RSHUNT = 0.1               (Resistor value in ohms)
+  ina219_shuntResistor_Ohms = 0.1;
 
   // 1. Determine max possible current
   // MaxPossible_I = VSHUNT_MAX / RSHUNT
@@ -465,18 +632,18 @@ void Adafruit_INA219::setCalibration_16V_400mA() {
       Adafruit_BusIO_Register(i2c_dev, INA219_REG_CALIBRATION, 2, MSBFIRST);
   calibration_reg.write(ina219_calValue, 2);
   // Set Config register to take into account the settings above
-  uint16_t config = INA219_CONFIG_BVOLTAGERANGE_16V |
+  ina219_configValue = INA219_CONFIG_BVOLTAGERANGE_16V |
                     INA219_CONFIG_GAIN_1_40MV | INA219_CONFIG_BADCRES_12BIT |
                     INA219_CONFIG_SADCRES_12BIT_1S_532US |
                     INA219_CONFIG_MODE_SANDBVOLT_CONTINUOUS;
 
   Adafruit_BusIO_Register config_reg =
       Adafruit_BusIO_Register(i2c_dev, INA219_REG_CONFIG, 2, MSBFIRST);
-  _success = config_reg.write(config, 2);
+  _success = config_reg.write(ina219_configValue, 2);
 }
 
 /*!
- *  @brief  Provides the the underlying return value from the last operation
+ *  @brief  Provides the underlying return value from the last operation
  *          called on the device.
  *  @return true: Last operation was successful false: Last operation failed
  *  @note   For function calls that have intermediary device operations,
@@ -484,3 +651,18 @@ void Adafruit_INA219::setCalibration_16V_400mA() {
  *          result is stored.
  */
 bool Adafruit_INA219::success() { return _success; }
+
+/*!
+ *  @brief  Provides access to the Conversion Ready flag from the last bus
+ *          voltage read on the device.
+ *  @return true: Last bus read operation had shown the Conversion Ready flag.
+ */
+bool Adafruit_INA219::conversionReady() { return _conversionReady; }
+
+/*!
+ *  @brief  Provides access to the Overflow flag from the last bus voltage
+ *          read on the device.
+ *  @return true: There was an overflow when calculating the current and/ or
+ *          power.
+ */
+bool Adafruit_INA219::overflow() { return _overflow; }

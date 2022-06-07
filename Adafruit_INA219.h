@@ -38,7 +38,7 @@
   (0x40 | (INA_ADDR0 != 0 ? 0x01 : 0x00) | (INA_ADDR1 != 0 ? 0x04 : 0x00))
 
 /** default I2C address **/
-#define INA219_ADDRESS (0x40) // 1000000 (A0+A1=GND)
+#define INA219_DEFAULT_ADDRESS (0x40) // 1000000 (A0+A1=GND)
 
 /** read **/
 #define INA219_READ (0x01)
@@ -57,7 +57,7 @@
 #define INA219_CONFIG_BVOLTAGERANGE_MASK (0x2000) // Bus Voltage Range Mask
 
 /** bus voltage range values **/
-enum {
+enum INA219_CONFIG_BVOLTAGERANGE {
   INA219_CONFIG_BVOLTAGERANGE_16V = (0x0000), // 0-16V Range
   INA219_CONFIG_BVOLTAGERANGE_32V = (0x2000), // 0-32V Range
 };
@@ -66,18 +66,18 @@ enum {
 #define INA219_CONFIG_GAIN_MASK (0x1800) // Gain Mask
 
 /** values for gain bits **/
-enum {
-  INA219_CONFIG_GAIN_1_40MV = (0x0000),  // Gain 1, 40mV Range
-  INA219_CONFIG_GAIN_2_80MV = (0x0800),  // Gain 2, 80mV Range
-  INA219_CONFIG_GAIN_4_160MV = (0x1000), // Gain 4, 160mV Range
-  INA219_CONFIG_GAIN_8_320MV = (0x1800), // Gain 8, 320mV Range
+enum INA219_CONFIG_GAIN {
+  INA219_CONFIG_GAIN_1_40MV = (0x0000),  // Gain /1, 40mV Range
+  INA219_CONFIG_GAIN_2_80MV = (0x0800),  // Gain /2, 80mV Range
+  INA219_CONFIG_GAIN_4_160MV = (0x1000), // Gain /4, 160mV Range
+  INA219_CONFIG_GAIN_8_320MV = (0x1800), // Gain /8, 320mV Range
 };
 
 /** mask for bus ADC resolution bits **/
 #define INA219_CONFIG_BADCRES_MASK (0x0780)
 
 /** values for bus ADC resolution **/
-enum {
+enum INA219_CONFIG_BADCRES {
   INA219_CONFIG_BADCRES_9BIT = (0x0000),  // 9-bit bus res = 0..511
   INA219_CONFIG_BADCRES_10BIT = (0x0080), // 10-bit bus res = 0..1023
   INA219_CONFIG_BADCRES_11BIT = (0x0100), // 11-bit bus res = 0..2047
@@ -104,7 +104,7 @@ enum {
   (0x0078) // Shunt ADC Resolution and Averaging Mask
 
 /** values for shunt ADC resolution **/
-enum {
+enum INA219_CONFIG_SADCRES {
   INA219_CONFIG_SADCRES_9BIT_1S_84US = (0x0000),   // 1 x 9-bit shunt sample
   INA219_CONFIG_SADCRES_10BIT_1S_148US = (0x0008), // 1 x 10-bit shunt sample
   INA219_CONFIG_SADCRES_11BIT_1S_276US = (0x0010), // 1 x 11-bit shunt sample
@@ -129,7 +129,7 @@ enum {
 #define INA219_CONFIG_MODE_MASK (0x0007) // Operating Mode Mask
 
 /** values for operating mode **/
-enum {
+enum INA219_CONFIG_MODE {
   INA219_CONFIG_MODE_POWERDOWN = 0x00,       /**< power down */
   INA219_CONFIG_MODE_SVOLT_TRIGGERED = 0x01, /**< shunt voltage triggered */
   INA219_CONFIG_MODE_BVOLT_TRIGGERED = 0x02, /**< bus voltage triggered */
@@ -163,9 +163,17 @@ enum {
  */
 class Adafruit_INA219 {
 public:
-  Adafruit_INA219(uint8_t addr = INA219_ADDRESS);
+  Adafruit_INA219(uint8_t addr = INA219_DEFAULT_ADDRESS);
   ~Adafruit_INA219();
   bool begin(TwoWire *theWire = &Wire);
+  void setConfiguration(INA219_CONFIG_BVOLTAGERANGE voltageRange, 
+            INA219_CONFIG_GAIN currentGain,
+            INA219_CONFIG_BADCRES busADCResolution,
+            INA219_CONFIG_SADCRES shuntADCResolution,
+            float shuntResistorOhms = 0, float shuntRatedCurrentAmps = 0,
+            float shuntRatedMilliVolts = 0,
+            float maxExpectedCurrentAmps = 0, uint16_t calibrationRegister = 0,
+            INA219_CONFIG_MODE operatingMode);
   void setCalibration_32V_2A();
   void setCalibration_32V_1A();
   void setCalibration_16V_400mA();
@@ -173,19 +181,29 @@ public:
   float getShuntVoltage_mV();
   float getCurrent_mA();
   float getPower_mW();
+  float getShuntResistor_Ohms();
+  uint16_t getConfig();
+  uint16_t getCalibration();
   void powerSave(bool on);
   bool success();
+  bool conversionReady();
+  bool overflow();
 
 private:
   Adafruit_I2CDevice *i2c_dev = NULL;
 
   bool _success;
+  bool _overflow;
+  bool _conversionReady;
 
   uint8_t ina219_i2caddr = -1;
+  // The following variables reflect the current configuration settings
+  float ina219_shuntResistor_Ohms;
+  uint32_t ina219_configValue;
   uint32_t ina219_calValue;
   // The following multipliers are used to convert raw current and power
   // values to mA and mW, taking into account the current config settings
-  uint32_t ina219_currentDivider_mA;
+  float ina219_currentDivider_mA;
   float ina219_powerMultiplier_mW;
 
   void init();
